@@ -1,0 +1,335 @@
+import mysql.connector
+import json
+import numpy as np
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from tqdm import tqdm
+
+# --- DB config -------------------------------------------------
+DB_CONFIG = {
+    "host": "127.0.0.1",
+    "user": "btc_user",
+    "password": "BtcPass123!",
+    "database": "bitcoin",
+    "port": 3306,
+}
+
+
+
+PATTERN_TABLE = "btc_pattern_1h"
+OHLC_TABLE    = "btc_ohlc_1m"
+MATCH_TABLE   = "btc_pattern_matches_json"
+PRODUCT_ID    = "BTC-USD"
+
+# matching + filter parameters
+SIM_THRESHOLD      = 0.80   # strict combined shape score (0..1)
+PRICE_LIMIT        = 500.0  # USD
+FUTURE_LOOKAHEAD   = 60     # minutes (60 x 1m candles)
+
+# parallel + commit settings
+MAX_WORKERS        = 100     # how many patterns to process at the same time
+MATCH_COMMIT_EVERY = 200    # commit after this many matches
+
+
+# -------- globals that workers will share (threads, so no copy) ----------
+G_closes = None
+G_ohlc_rows = None
+G_ts_list = None
+
+
+def get_mysql_connection():
+    return mysql.connector.connect(**DB_CONFIG)
+
+
+def load_all_ohlc():
+    conn = get_mysql_connection()
+    cur = conn.cursor(dictionary=True)
+
+    cur.execute(
+        f"""
+        SELECT id,
+               product_id,
+               ts,
+               open_price,
+               high_price,
+               low_price,
+               close_price,
+               volume
+        FROM {OHLC_TABLE}
+        WHERE product_id = %s
+        ORDER BY ts
+        """,
+        (PRODUCT_ID,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    closes = np.array([float(r["close_price"]) for r in rows], dtype=float)
+    ts_list = [r["ts"] for r in rows]
+    return closes, rows, ts_list
+
+
+def load_all_patterns():
+    conn = get_mysql_connection()
+    cur = conn.cursor(dictionary=True)
+    cur.execute(
+        f"""
+        SELECT id, window_start_ts, pattern
+        FROM {PATTERN_TABLE}
+        ORDER BY id
+        """
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+def extract_close_prices(pattern_json):
+    candles = json.loads(pattern_json)
+    return np.array([float(c["close_price"]) for c in candles], dtype=float)
+
+
+def normalize(series: np.ndarray) -> np.ndarray:
+    arr = np.asarray(series, dtype=float)
+    if arr.size == 0:
+        return arr
+    mean = arr.mean()
+    std = arr.std()
+    if std == 0:
+        return np.zeros_like(arr)
+    return (arr - mean) / std
+
+
+def shape_similarity(series_a, series_b) -> float:
+    a = np.asarray(series_a, dtype=float)
+    b = np.asarray(series_b, dtype=float)
+    if a.size != b.size or a.size < 2:
+        return 0.0
+
+    # 1) level correlation (normalized prices)
+    an = normalize(a)
+    bn = normalize(b)
+    denom = np.linalg.norm(an) * np.linalg.norm(bn)
+    if denom == 0:
+        level_corr = 0.0
+    else:
+        level_corr = float(np.dot(an, bn) / denom)
+
+    # 2) correlation of first differences
+    da = np.diff(a)
+    db = np.diff(b)
+    if da.std() == 0 or db.std() == 0:
+        diff_corr = 0.0
+    else:
+        dan = normalize(da)
+        dbn = normalize(db)
+        denom2 = np.linalg.norm(dan) * np.linalg.norm(dbn)
+        if denom2 == 0:
+            diff_corr = 0.0
+        else:
+            diff_corr = float(np.dot(dan, dbn) / denom2)
+
+    # 3) direction match ratio
+    eps = 1e-6
+    sa = np.sign(da)
+    sb = np.sign(db)
+    sa[np.abs(da) < eps] = 0
+    sb[np.abs(db) < eps] = 0
+    direction_match = float((sa == sb).mean())
+
+    level_corr = max(0.0, level_corr)
+    diff_corr  = max(0.0, diff_corr)
+
+    score = (level_corr + diff_corr + direction_match) / 3.0
+    return score
+
+
+def rows_to_candles_json(rows_slice):
+    candles = []
+    for r in rows_slice:
+        ts = r["ts"]
+        if isinstance(ts, datetime):
+            ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            ts_str = str(ts)
+
+        candles.append({
+            "id":         int(r["id"]),
+            "product_id": r["product_id"],
+            "ts":         ts_str,
+            "open":       float(r["open_price"]),
+            "high":       float(r["high_price"]),
+            "low":        float(r["low_price"]),
+            "close":      float(r["close_price"]),
+            "volume":     float(r["volume"]),
+        })
+
+    return json.dumps(candles, separators=(",", ":"))
+
+
+def insert_match(cur, pattern_id, candles_json):
+    cur.execute(
+        f"""
+        INSERT INTO {MATCH_TABLE}
+            (pattern_id, candles_json)
+        VALUES (%s, %s)
+        """,
+        (pattern_id, candles_json),
+    )
+
+
+def ranges_overlap(a_start, a_end, b_start, b_end) -> bool:
+    return not (a_end < b_start or a_start > b_end)
+
+
+# ---------------- worker: process a single pattern ----------------
+def process_single_pattern(pat, slot):
+    """
+    Runs in a thread. Uses global G_closes, G_ohlc_rows, G_ts_list.
+    Returns (pattern_id, matches) where matches is
+    a list of (pattern_id, candles_json).
+
+    slot = 0..MAX_WORKERS-1  -> used as tqdm 'position'
+    """
+    pattern_id      = pat["id"]
+    window_start_ts = pat["window_start_ts"]
+    pat_closes      = extract_close_prices(pat["pattern"])
+    n_pat           = len(pat_closes)
+
+    local_matches = []
+
+    if n_pat < 2:
+        return pattern_id, local_matches
+
+    closes    = G_closes
+    ohlc_rows = G_ohlc_rows
+    ts_list   = G_ts_list
+
+    n_ohlc = len(closes)
+
+    orig_start_ts = window_start_ts
+    orig_end_ts   = window_start_ts + timedelta(minutes=n_pat - 1)
+
+    max_start = n_ohlc - n_pat
+    blocked_until_idx = -1
+
+    # this tqdm bar will appear on its own line (slot) in the console
+    bar = tqdm(
+        range(max_start + 1),
+        desc=f"Pattern {pattern_id}",
+        position=slot,
+        leave=True,
+        mininterval=0.3,
+    )
+
+    for start_idx in bar:
+        if start_idx <= blocked_until_idx:
+            continue
+
+        end_idx = start_idx + n_pat - 1
+        win_start_ts = ts_list[start_idx]
+        win_end_ts   = ts_list[end_idx]
+
+        if ranges_overlap(win_start_ts, win_end_ts, orig_start_ts, orig_end_ts):
+            continue
+
+        window_closes = closes[start_idx : start_idx + n_pat]
+        score = shape_similarity(pat_closes, window_closes)
+        if score < SIM_THRESHOLD:
+            continue
+
+        ref_price = closes[end_idx]
+
+        future_start = end_idx + 1
+        future_end   = min(future_start + FUTURE_LOOKAHEAD, n_ohlc)
+        if future_start >= n_ohlc:
+            continue
+
+        future_max  = float(closes[future_start:future_end].max())
+        future_jump = future_max - ref_price
+
+        if future_jump >= PRICE_LIMIT:
+            continue
+
+        candles_json = rows_to_candles_json(
+            ohlc_rows[start_idx : start_idx + n_pat]
+        )
+        local_matches.append((pattern_id, candles_json))
+
+        blocked_until_idx = end_idx
+
+    bar.close()
+    return pattern_id, local_matches
+
+
+# ---------------- main driver ----------------
+def find_and_insert_matches():
+    global G_closes, G_ohlc_rows, G_ts_list
+
+    closes, ohlc_rows, ts_list = load_all_ohlc()
+    G_closes    = closes
+    G_ohlc_rows = ohlc_rows
+    G_ts_list   = ts_list
+
+    n_ohlc = len(closes)
+    patterns = load_all_patterns()
+    total_patterns = len(patterns)
+
+    print(f"Loaded {total_patterns} patterns")
+    print(f"Loaded {n_ohlc:,} OHLC candles\n")
+
+    conn = get_mysql_connection()
+    cur_insert = conn.cursor()
+    inserted_since_commit = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        free_slots = list(range(MAX_WORKERS))  # available tqdm positions
+        active = {}  # future -> slot
+        pattern_idx = 0
+
+        overall_bar = tqdm(total=total_patterns, desc="Patterns done", position=MAX_WORKERS, leave=True)
+
+        # scheduler loop
+        while pattern_idx < total_patterns or active:
+            # start new tasks while we have free slots and patterns left
+            while free_slots and pattern_idx < total_patterns:
+                slot = free_slots.pop()
+                pat = patterns[pattern_idx]
+                pattern_idx += 1
+                fut = executor.submit(process_single_pattern, pat, slot)
+                active[fut] = slot
+
+            if not active:
+                break
+
+            # wait until at least one pattern finishes
+            done, _ = wait(list(active.keys()), return_when=FIRST_COMPLETED)
+
+            for fut in done:
+                slot = active.pop(fut)
+                free_slots.append(slot)
+
+                pattern_id, matches = fut.result()
+
+                for pid, candles_json in matches:
+                    insert_match(cur_insert, pid, candles_json)
+                    inserted_since_commit += 1
+                    if inserted_since_commit >= MATCH_COMMIT_EVERY:
+                        conn.commit()
+                        inserted_since_commit = 0
+
+                overall_bar.update(1)
+
+        overall_bar.close()
+
+    if inserted_since_commit > 0:
+        conn.commit()
+
+    cur_insert.close()
+    conn.close()
+
+
+if __name__ == "__main__":
+    find_and_insert_matches()
