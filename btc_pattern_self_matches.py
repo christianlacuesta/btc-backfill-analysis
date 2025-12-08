@@ -1,10 +1,8 @@
 import mysql.connector
 import json
 import numpy as np
-from tqdm import tqdm
 from datetime import datetime, timedelta
 
-# --- DB config -------------------------------------------------
 DB_CONFIG = {
     "host": "127.0.0.1",
     "user": "btc_user",
@@ -16,21 +14,15 @@ DB_CONFIG = {
 PATTERN_TABLE = "btc_pattern_1h"
 MATCH_TABLE   = "btc_pattern_self_matches"
 
-# similarity settings
-SIM_THRESHOLD   = 0.85    # 0..1, raise/lower as you like
-SKIP_OVERLAP_TS = True    # skip pairs whose time windows overlap
+SIM_THRESHOLD   = 0.75
+SKIP_OVERLAP_TS = True
 
 
-# ---------------------------------------------------------------
 def get_mysql_connection():
     return mysql.connector.connect(**DB_CONFIG)
 
 
 def load_patterns():
-    """
-    Load all patterns (id, window_start_ts, pattern JSON)
-    and precompute close arrays + length.
-    """
     conn = get_mysql_connection()
     cur = conn.cursor(dictionary=True)
 
@@ -47,14 +39,15 @@ def load_patterns():
 
     patterns = []
     for r in rows:
-        pid = r["id"]
+        pid      = r["id"]
         start_ts = r["window_start_ts"]
-        candles = json.loads(r["pattern"])
-        closes = np.array([float(c["close_price"]) for c in candles],
-                          dtype=float)
-        n = len(closes)
+        candles  = json.loads(r["pattern"])
 
-        # compute the time range for this pattern (1 candle per minute)
+        closes = np.array(
+            [float(c["close_price"]) for c in candles],
+            dtype=float
+        )
+        n = len(closes)
         end_ts = start_ts + timedelta(minutes=n - 1)
 
         patterns.append({
@@ -80,27 +73,16 @@ def normalize(series: np.ndarray) -> np.ndarray:
 
 
 def shape_similarity(series_a, series_b) -> float:
-    """
-    Combined shape score (0..1) using:
-      - correlation of normalized levels
-      - correlation of normalized first differences
-      - ratio of matching move directions
-    """
     a = np.asarray(series_a, dtype=float)
     b = np.asarray(series_b, dtype=float)
     if a.size != b.size or a.size < 2:
         return 0.0
 
-    # 1) level correlation
     an = normalize(a)
     bn = normalize(b)
     denom = np.linalg.norm(an) * np.linalg.norm(bn)
-    if denom == 0:
-        level_corr = 0.0
-    else:
-        level_corr = float(np.dot(an, bn) / denom)
+    level_corr = float(np.dot(an, bn) / denom) if denom != 0 else 0.0
 
-    # 2) diff correlation
     da = np.diff(a)
     db = np.diff(b)
     if da.std() == 0 or db.std() == 0:
@@ -109,12 +91,8 @@ def shape_similarity(series_a, series_b) -> float:
         dan = normalize(da)
         dbn = normalize(db)
         denom2 = np.linalg.norm(dan) * np.linalg.norm(dbn)
-        if denom2 == 0:
-            diff_corr = 0.0
-        else:
-            diff_corr = float(np.dot(dan, dbn) / denom2)
+        diff_corr = float(np.dot(dan, dbn) / denom2) if denom2 != 0 else 0.0
 
-    # 3) direction match ratio
     eps = 1e-6
     sa = np.sign(da)
     sb = np.sign(db)
@@ -122,7 +100,6 @@ def shape_similarity(series_a, series_b) -> float:
     sb[np.abs(db) < eps] = 0
     direction_match = float((sa == sb).mean())
 
-    # clamp negative correlations to 0
     level_corr = max(0.0, level_corr)
     diff_corr  = max(0.0, diff_corr)
 
@@ -131,71 +108,71 @@ def shape_similarity(series_a, series_b) -> float:
 
 
 def ranges_overlap(a_start, a_end, b_start, b_end) -> bool:
-    """Return True if [a_start, a_end] intersects [b_start, b_end]."""
     return not (a_end < b_start or a_start > b_end)
 
 
-def insert_match(cur, pattern_id_1, pattern_id_2, score):
-    cur.execute(
-        f"""
-        INSERT IGNORE INTO {MATCH_TABLE}
-            (pattern_id_1, pattern_id_2, sim_score)
-        VALUES (%s, %s, %s)
-        """,
-        (pattern_id_1, pattern_id_2, float(score)),
-    )
-
-
-# ---------------------------------------------------------------
 def find_self_matches():
     patterns = load_patterns()
     total = len(patterns)
-    print(f"Loaded {total} patterns")
-
-    # group by length so we only compare same-sized patterns
-    groups = {}
-    for p in patterns:
-        groups.setdefault(p["len"], []).append(p)
+    print(f"Loaded {total} patterns\n")
 
     conn = get_mysql_connection()
     cur  = conn.cursor()
 
-    for length, group in groups.items():
-        n = len(group)
-        if n < 2:
-            continue
+    for i in range(total):
+        pi = patterns[i]
+        print(f"🔵 Base pattern {pi['id']} ({i+1}/{total}) – scanning {total} rows...")
 
-        print(f"\n--- Length {length} candles: {n} patterns ---")
+        compared = 0
+        matches  = 0
 
-        # pairwise i < j inside this length group
-        num_pairs = n * (n - 1) // 2
-        pbar = tqdm(total=num_pairs, desc=f"len={length}")
+        for j in range(total):
+            pj = patterns[j]
+            compared += 1
 
-        for i in range(n):
-            pi = group[i]
-            for j in range(i + 1, n):
-                pj = group[j]
-                pbar.update(1)
+            # progress every 1000 rows (tune this if you want)
+            if compared == 1 or compared % 1000 == 0 or compared == total:
+                print(f"   … progress: checked {compared}/{total} rows")
 
-                # optional: skip overlapping time ranges
-                if SKIP_OVERLAP_TS and ranges_overlap(
-                        pi["start_ts"], pi["end_ts"],
-                        pj["start_ts"], pj["end_ts"]):
-                    continue
+            if pi["id"] == pj["id"]:
+                continue
 
-                score = shape_similarity(pi["closes"], pj["closes"])
-                if score < SIM_THRESHOLD:
-                    continue
+            if pi["len"] != pj["len"]:
+                continue
 
-                insert_match(cur, pi["id"], pj["id"], score)
-                conn.commit()
+            if SKIP_OVERLAP_TS and ranges_overlap(
+                pi["start_ts"], pi["end_ts"],
+                pj["start_ts"], pj["end_ts"]
+            ):
+                continue
 
-                tqdm.write(
-                    f"[MATCH] {pi['id']} vs {pj['id']} | "
-                    f"len={length} | score={score:.3f}"
-                )
+            score = shape_similarity(pi["closes"], pj["closes"])
+            if score < SIM_THRESHOLD:
+                continue
 
-        pbar.close()
+            pid1 = min(pi["id"], pj["id"])
+            pid2 = max(pi["id"], pj["id"])
+
+            cur.execute(
+                f"""
+                INSERT IGNORE INTO {MATCH_TABLE}
+                    (pattern_id_1, pattern_id_2, sim_score)
+                VALUES (%s, %s, %s)
+                """,
+                (pid1, pid2, float(score)),
+            )
+            conn.commit()
+            matches += 1
+
+            print(
+                f"      ✅ MATCH INSERTED: base={pi['id']} vs other={pj['id']} "
+                f"(stored as {pid1}, {pid2}) score={score:.4f}"
+            )
+
+        print(
+            f"🟦 Finished base pattern {pi['id']}: "
+            f"compared {compared} rows, found {matches} matches.\n"
+        )
 
     cur.close()
     conn.close()
