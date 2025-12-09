@@ -5,35 +5,38 @@ import numpy as np
 from datetime import timedelta
 from google.cloud import bigquery
 
-# ---- CONFIG -----------------------------------------------------------------
+# -------------------------------------------------------------------
+# CONFIG
+# -------------------------------------------------------------------
 
 PROJECT_ID = os.getenv("PROJECT_ID", "bitcoin-480204")
-DATASET = os.getenv("DATASET", "crypto")
+DATASET    = os.getenv("DATASET", "crypto")
 
 PRODUCT_ID      = os.getenv("PRODUCT_ID", "BTC-USD")
-SIM_THRESHOLD   = float(os.getenv("SIM_THRESHOLD", "0.75"))   # min similarity
-MOVE_THRESHOLD  = float(os.getenv("MOVE_THRESHOLD", "500.0")) # +$500 move
+SIM_THRESHOLD   = float(os.getenv("SIM_THRESHOLD", "0.75"))
+MOVE_THRESHOLD  = float(os.getenv("MOVE_THRESHOLD", "500.0"))  # +USD
 WINDOW_MINUTES  = int(os.getenv("WINDOW_MINUTES", "60"))
 FUTURE_MINUTES  = int(os.getenv("FUTURE_MINUTES", "5"))
 
-OHLC_TABLE       = f"{PROJECT_ID}.{DATASET}.btc_ohlc_1m"
-POS_PATTERN_TBL  = f"{PROJECT_ID}.{DATASET}.btc_pattern_1h"
-NEG_PATTERN_TBL  = f"{PROJECT_ID}.{DATASET}.btc_pattern_1h_neg_from_pos"
+OHLC_TABLE_FQN      = f"{PROJECT_ID}.{DATASET}.btc_ohlc_1m"
+POS_PATTERN_FQN     = f"{PROJECT_ID}.{DATASET}.btc_pattern_1h"
+NEG_PATTERN_FQN     = f"{PROJECT_ID}.{DATASET}.btc_pattern_1h_neg_from_pos"
+SELF_MATCH_FQN      = f"{PROJECT_ID}.{DATASET}.btc_pattern_self_matches"
 
 client = bigquery.Client(project=PROJECT_ID)
 
-
-# ---- HELPER FUNCTIONS -------------------------------------------------------
+# -------------------------------------------------------------------
+# GENERIC HELPERS
+# -------------------------------------------------------------------
 
 def get_next_id(table_fqn: str) -> int:
-    """Return max(id)+1 for the given table (BigQuery has no auto-increment)."""
+    """Return max(id)+1 for a table that uses INTEGER id."""
     query = f"SELECT IFNULL(MAX(id), 0) + 1 AS next_id FROM `{table_fqn}`"
     rows = list(client.query(query).result())
     return rows[0].next_id if rows else 1
 
 
-def hash_seq(closes: np.ndarray) -> str:
-    """Create a hash from closes normalized vs first close."""
+def hash_seq(closes):
     closes = np.asarray(closes, dtype=float)
     if closes.size == 0:
         return ""
@@ -55,7 +58,7 @@ def normalize(series: np.ndarray) -> np.ndarray:
 
 
 def shape_similarity(series_a, series_b) -> float:
-    """Combined score of level, first-diff and direction similarity."""
+    """Combined similarity: level, first-diff, and direction agreement."""
     a = np.asarray(series_a, dtype=float)
     b = np.asarray(series_b, dtype=float)
     if a.size != b.size or a.size < 2:
@@ -78,7 +81,7 @@ def shape_similarity(series_a, series_b) -> float:
         denom2 = np.linalg.norm(dan) * np.linalg.norm(dbn)
         diff_corr = float(np.dot(dan, dbn) / denom2) if denom2 != 0 else 0.0
 
-    # 3) directional match
+    # 3) directional agreement
     eps = 1e-6
     sa = np.sign(da)
     sb = np.sign(db)
@@ -86,19 +89,25 @@ def shape_similarity(series_a, series_b) -> float:
     sb[np.abs(db) < eps] = 0
     direction_match = float((sa == sb).mean())
 
-    # clamp negatives to zero
+    # clamp negatives
     level_corr = max(0.0, level_corr)
     diff_corr  = max(0.0, diff_corr)
 
     return (level_corr + diff_corr + direction_match) / 3.0
 
 
-# ---- LOAD EXISTING POSITIVE PATTERNS ----------------------------------------
+def ranges_overlap(a_start, a_end, b_start, b_end) -> bool:
+    return not (a_end < b_start or a_start > b_end)
 
-def load_patterns():
+# -------------------------------------------------------------------
+# LOAD EXISTING POSITIVE PATTERNS (for similarity / negative-from-pos)
+# -------------------------------------------------------------------
+
+def load_existing_patterns():
+    """Load all positive patterns for similarity comparison."""
     query = f"""
         SELECT id, window_start_ts, pattern
-        FROM `{POS_PATTERN_TBL}`
+        FROM `{POS_PATTERN_FQN}`
         ORDER BY id
     """
     rows = client.query(query).result()
@@ -124,15 +133,16 @@ def load_patterns():
     print(f"[INFO] Loaded {len(patterns)} existing positive patterns.")
     return patterns
 
-
-# ---- LOAD CURRENT 60M WINDOW + FUTURE 5M FROM BTC_OHLC_1M -------------------
+# -------------------------------------------------------------------
+# LOAD CURRENT 60M WINDOW + FUTURE 5M FROM btc_ohlc_1m
+# -------------------------------------------------------------------
 
 def load_current_window_and_future():
-    """Return signal_ts, window_start_ts, window_rows, future_rows."""
-    # latest timestamp
+    """Return (signal_ts, window_start_ts, window_rows, future_rows)."""
+    # latest timestamp for given product
     query_max = f"""
         SELECT MAX(ts) AS max_ts
-        FROM `{OHLC_TABLE}`
+        FROM `{OHLC_TABLE_FQN}`
         WHERE product_id = @product
     """
     job_config = bigquery.QueryJobConfig(
@@ -142,16 +152,16 @@ def load_current_window_and_future():
     )
     rows = list(client.query(query_max, job_config=job_config).result())
     if not rows or rows[0].max_ts is None:
-        raise RuntimeError("No candles found for product.")
+        raise RuntimeError("No candles found for product in btc_ohlc_1m.")
 
     max_ts = rows[0].max_ts
     signal_ts = max_ts - timedelta(minutes=FUTURE_MINUTES)
     window_start_ts = signal_ts - timedelta(minutes=WINDOW_MINUTES - 1)
 
-    # fetch window + future
+    # window + 5m future
     query_window = f"""
         SELECT ts, open_price, high_price, low_price, close_price, volume
-        FROM `{OHLC_TABLE}`
+        FROM `{OHLC_TABLE_FQN}`
         WHERE product_id = @product
           AND ts BETWEEN @start_ts AND @end_ts
         ORDER BY ts
@@ -166,7 +176,7 @@ def load_current_window_and_future():
     rows = list(client.query(query_window, job_config=job_config).result())
 
     if len(rows) < WINDOW_MINUTES + FUTURE_MINUTES:
-        raise RuntimeError("Not enough candles for window + future.")
+        raise RuntimeError("Not enough candles for 60m window + future.")
 
     window_rows = [r for r in rows if r.ts <= signal_ts][-WINDOW_MINUTES:]
     future_rows = [r for r in rows if r.ts > signal_ts][:FUTURE_MINUTES]
@@ -198,27 +208,139 @@ def build_pattern_json(window_rows):
         })
     return json.dumps(records)
 
+# -------------------------------------------------------------------
+# SELF-MATCH: only for a given (new) pattern_id
+# -------------------------------------------------------------------
 
-# ---- MAIN PATTERN CHECK + INSERT --------------------------------------------
+def run_self_match_for_pattern_id(pattern_id: int):
+    """Self-match a single positive pattern against all others."""
+    print(f"[SELF] Starting self-match for pattern id={pattern_id}")
 
-def check_current_window_and_insert():
-    patterns = load_patterns()
-    if not patterns:
-        print("[WARN] No existing patterns to compare against. Exiting.")
+    # load base pattern
+    base_query = f"""
+        SELECT id, window_start_ts, pattern
+        FROM `{POS_PATTERN_FQN}`
+        WHERE id = @pid
+        LIMIT 1
+    """
+    base_rows = list(
+        client.query(
+            base_query,
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("pid", "INT64", pattern_id)
+                ]
+            ),
+        ).result()
+    )
+    if not base_rows:
+        print(f"[SELF] Pattern id={pattern_id} not found, skip self-match.")
         return
 
-    signal_ts, window_start_ts, window_rows, future_rows = load_current_window_and_future()
+    base_row = base_rows[0]
+    base_start = base_row.window_start_ts
+    base_candles = json.loads(base_row.pattern)
+    base_closes = np.array(
+        [float(c["close_price"]) for c in base_candles], dtype=float
+    )
+    base_len = len(base_closes)
+    base_end = base_start + timedelta(minutes=base_len - 1)
+
+    # load all other patterns
+    others_query = f"""
+        SELECT id, window_start_ts, pattern
+        FROM `{POS_PATTERN_FQN}`
+        WHERE id != @pid
+        ORDER BY id
+    """
+    others = client.query(
+        others_query,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("pid", "INT64", pattern_id)
+            ]
+        ),
+    ).result()
+
+    matches = []
+    total = 0
+    for r in others:
+        total += 1
+        other_id = r.id
+        other_start = r.window_start_ts
+        ocandles = json.loads(r.pattern)
+        ocloses = np.array(
+            [float(c["close_price"]) for c in ocandles], dtype=float
+        )
+        olen = len(ocloses)
+        other_end = other_start + timedelta(minutes=olen - 1)
+
+        if olen != base_len:
+            continue
+
+        if ranges_overlap(base_start, base_end, other_start, other_end):
+            continue
+
+        score = shape_similarity(base_closes, ocloses)
+        if score < SIM_THRESHOLD:
+            continue
+
+        pid1 = min(pattern_id, other_id)
+        pid2 = max(pattern_id, other_id)
+
+        matches.append(
+            {
+                "pattern_id_1": int(pid1),
+                "pattern_id_2": int(pid2),
+                "sim_score": float(score),
+            }
+        )
+
+        print(
+            f"[SELF] match base={pattern_id} vs other={other_id} "
+            f"(stored {pid1},{pid2}) score={score:.4f}"
+        )
+
+    if not matches:
+        print(f"[SELF] No self-matches found for pattern id={pattern_id}.")
+        return
+
+    errors = client.insert_rows_json(SELF_MATCH_FQN, matches)
+    if errors:
+        print("[SELF] insert_rows_json errors:", errors)
+    else:
+        print(
+            f"[SELF] Inserted {len(matches)} self-match rows for pattern id={pattern_id}."
+        )
+
+# -------------------------------------------------------------------
+# MAIN: classify current window and insert + self-match
+# -------------------------------------------------------------------
+
+def process_current_window():
+    # load historical patterns for similarity / negative-from-pos
+    patterns = load_existing_patterns()
+
+    signal_ts, window_start_ts, window_rows, future_rows = (
+        load_current_window_and_future()
+    )
     print(f"[INFO] signal_ts={signal_ts}, window_start_ts={window_start_ts}")
 
     delta = compute_future_delta(window_rows, future_rows)
-    print(f"[INFO] Future delta over next {FUTURE_MINUTES} minutes: {delta:.2f} USD")
-
-    # compare shape vs existing positive patterns
-    current_closes = np.array(
-        [float(r.close_price) for r in window_rows],
-        dtype=float
+    print(
+        f"[INFO] Future delta over next {FUTURE_MINUTES} minutes: {delta:.2f} USD"
     )
 
+    # if no existing patterns, we cannot compute similarity-based label
+    if not patterns:
+        print("[INFO] No existing patterns to compare with. Skipping.")
+        return
+
+    current_closes = np.array(
+        [float(r.close_price) for r in window_rows], dtype=float
+    )
+
+    # best similarity against existing positive patterns
     best_score = 0.0
     best_pattern_id = None
     for p in patterns:
@@ -229,47 +351,63 @@ def check_current_window_and_insert():
             best_score = score
             best_pattern_id = p["id"]
 
-    print(f"[INFO] Best similarity score: {best_score:.4f} (pattern_id={best_pattern_id})")
+    print(
+        f"[INFO] Best similarity score: {best_score:.4f} "
+        f"(pattern_id={best_pattern_id})"
+    )
 
-    # if it doesn't look like any known pattern, do nothing
     if best_score < SIM_THRESHOLD:
-        print(f"[INFO] Best score < SIM_THRESHOLD={SIM_THRESHOLD}. No insert.")
+        print(
+            f"[INFO] Best score < SIM_THRESHOLD={SIM_THRESHOLD}. "
+            f"No positive/negative-from-pos insert."
+        )
         return
 
     pattern_json = build_pattern_json(window_rows)
     pattern_hash = hash_seq(current_closes)
 
     if delta >= MOVE_THRESHOLD:
-        # POSITIVE: reached +500 USD -> insert into btc_pattern_1h
-        new_id = get_next_id(POS_PATTERN_TBL)
-        rows_to_insert = [{
-            "id": new_id,
-            "signal_ts": signal_ts,
-            "window_start_ts": window_start_ts,
-            "delta": float(delta),
-            "pattern": pattern_json,
-        }]
-        errors = client.insert_rows_json(POS_PATTERN_TBL, rows_to_insert)
+        # ------------------ POSITIVE PATTERN ------------------
+        new_id = get_next_id(POS_PATTERN_FQN)
+        rows_to_insert = [
+            {
+                "id": new_id,
+                "signal_ts": signal_ts,
+                "window_start_ts": window_start_ts,
+                "delta": float(delta),
+                "pattern": pattern_json,
+            }
+        ]
+        errors = client.insert_rows_json(POS_PATTERN_FQN, rows_to_insert)
         if errors:
             print("[ERROR] Insert errors (positive table):", errors)
-        else:
-            print(
-                f"[OK] POSITIVE pattern inserted id={new_id}, "
-                f"delta={delta:.2f}, score={best_score:.4f}, match_id={best_pattern_id}"
-            )
+            return
+
+        print(
+            f"[OK] POSITIVE pattern inserted id={new_id}, "
+            f"delta={delta:.2f}, score={best_score:.4f}, match_id={best_pattern_id}"
+        )
+
+        # --------- NEW: run self match for this new positive pattern ---------
+        run_self_match_for_pattern_id(new_id)
+
     else:
-        # NEGATIVE: pattern shape but DID NOT reach +500 -> btc_pattern_1h_neg_from_pos
-        new_id = get_next_id(NEG_PATTERN_TBL)
-        rows_to_insert = [{
-            "id": new_id,
-            "pattern_id": int(best_pattern_id) if best_pattern_id is not None else None,
-            "pattern_hash": pattern_hash,
-            "signal_ts": signal_ts,
-            "window_start_ts": window_start_ts,
-            "delta": float(delta),
-            "candles": pattern_json,
-        }]
-        errors = client.insert_rows_json(NEG_PATTERN_TBL, rows_to_insert)
+        # ------------------ NEGATIVE FROM POSITIVE ------------------
+        new_id = get_next_id(NEG_PATTERN_FQN)
+        rows_to_insert = [
+            {
+                "id": new_id,
+                "pattern_id": int(best_pattern_id)
+                if best_pattern_id is not None
+                else None,
+                "pattern_hash": pattern_hash,
+                "signal_ts": signal_ts,
+                "window_start_ts": window_start_ts,
+                "delta": float(delta),
+                "candles": pattern_json,
+            }
+        ]
+        errors = client.insert_rows_json(NEG_PATTERN_FQN, rows_to_insert)
         if errors:
             print("[ERROR] Insert errors (negative table):", errors)
         else:
@@ -281,6 +419,6 @@ def check_current_window_and_insert():
 
 
 if __name__ == "__main__":
-    print("[INFO] BTC pattern job started.")
-    check_current_window_and_insert()
-    print("[INFO] BTC pattern job finished.")
+    print("[INFO] BTC pattern + self-match job started.")
+    process_current_window()
+    print("[INFO] BTC pattern + self-match job finished.")
